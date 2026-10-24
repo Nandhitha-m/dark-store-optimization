@@ -69,6 +69,37 @@ def empty_kpi_row(max_distance_km: float, status: str = "Infeasible", reason: st
     }
 
 
+def normalize_kpi_columns(kpi_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize KPI column names across all runtime paths and avoid dataframe-key mismatches."""
+    if kpi_df is None:
+        return pd.DataFrame()
+
+    if not isinstance(kpi_df, pd.DataFrame):
+        try:
+            kpi_df = pd.DataFrame([kpi_df])
+        except Exception:
+            return pd.DataFrame()
+
+    rename_map = {
+        "status": "Status",
+        "reason": "Reason",
+        "profit": "Profit",
+        "revenue": "Revenue",
+        "delivery_cost": "Delivery cost",
+        "fixed_cost": "Fixed cost",
+        "stores_opened": "Stores opened",
+        "demand_served": "Demand served",
+        "service_rate": "Service rate (%)",
+        "avg_distance_km": "Average distance (km)",
+        "max_distance_km": "Max distance (km)",
+    }
+
+    columns_to_rename = {old: new for old, new in rename_map.items() if old in kpi_df.columns and new not in kpi_df.columns}
+    if columns_to_rename:
+        kpi_df = kpi_df.rename(columns=columns_to_rename)
+    return kpi_df
+
+
 # ---------------------------
 # Synthetic data generation
 # ---------------------------
@@ -456,7 +487,7 @@ if start_button:
     st.session_state.run_clicked = True
 
 st.write(
-    "Assumptions: Chennai city geography is approximated with a realistic latitude/longitude box, customer demand is random but clustered in major neighborhoods, and each candidate dark store has a fixed opening cost and finite daily capacity."
+    "Assumptions: Chennai city geography is approximated with a realistic latitude/longitude box, customer demand is random but clustered in major neighborhoods, and each candidate dark store has moderate operating costs and capacity."
 )
 
 if st.session_state.run_clicked:
@@ -524,9 +555,9 @@ if st.session_state.run_clicked:
             )
 
         if not scenario_rows:
-            kpi_df = pd.DataFrame([empty_kpi_row(max_distance_km, status="No feasible runs", reason="No tested store limits fit the candidate count.")])
+            kpi_df = normalize_kpi_columns(pd.DataFrame([empty_kpi_row(max_distance_km, status="No feasible runs", reason="No tested store limits fit the candidate count.")]))
         else:
-            kpi_df = pd.DataFrame(scenario_rows)
+            kpi_df = normalize_kpi_columns(pd.DataFrame(scenario_rows))
 
         st.session_state.last_run = {
             "customers": customers,
@@ -588,55 +619,59 @@ if st.session_state.run_clicked:
         st.info("Try reducing the service distance if the model becomes infeasible, or lower the customer/store count to keep the feasibility search stable.")
 
 elif st.session_state.last_run is not None:
-    last_run = st.session_state.last_run
-    kpi_df = last_run["kpi_df"]
-    model_outputs = last_run["model_outputs"]
-    customers = last_run["customers"]
-    stores = last_run["stores"]
+    try:
+        last_run = st.session_state.last_run
+        kpi_df = normalize_kpi_columns(last_run["kpi_df"])
+        model_outputs = last_run["model_outputs"]
+        customers = last_run["customers"]
+        stores = last_run["stores"]
 
-    st.subheader("1) KPI summary")
-    st.dataframe(kpi_df, use_container_width=True)
+        st.subheader("1) KPI summary")
+        st.dataframe(kpi_df, use_container_width=True)
 
-    feasible_rows = kpi_df[kpi_df["Status"].isin(["Optimal", "Feasible"])].copy()
-    if not feasible_rows.empty:
-        best_row = feasible_rows.loc[feasible_rows["Profit"].idxmax()]
-        best_limit = int(best_row["Open store limit"])
-        st.success(
-            f"Best configuration for this run: open-store limit = {best_limit}, profit = ₹{best_row['Profit']:.2f}, "
-            f"service rate = {best_row['Service rate (%)']:.2f}%"
-        )
-    else:
-        st.warning("No feasible solution was found for any tested store limit. See the reason column above.")
-
-    st.subheader("Profit vs. maximum open stores")
-    fig = px.line(
-        kpi_df,
-        x="Open store limit",
-        y="Profit",
-        markers=True,
-        title="Profit sensitivity to the maximum number of dark stores allowed to open",
-        labels={"Open store limit": "Max stores allowed to open", "Profit": "Profit (₹)"},
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    valid_profit_rows = kpi_df[kpi_df["Status"].isin(["Optimal", "Feasible"]) & (kpi_df["Profit"] > 0)]
-    if not valid_profit_rows.empty:
-        best_limit = int(valid_profit_rows.loc[valid_profit_rows["Profit"].idxmax(), "Open store limit"])
-        selected_result = model_outputs.get(best_limit, {"open_stores": [], "assigned_orders": []})
-        open_stores = selected_result.get("open_stores", [])
-        assigned_orders = selected_result.get("assigned_orders", [])
-
-        st.subheader("2) Detailed solution map")
-        if open_stores or assigned_orders:
-            map_obj = draw_solution_map(customers, stores, open_stores, assigned_orders)
-            st_folium(map_obj, width=1200, height=700)
+        feasible_rows = kpi_df[kpi_df["Status"].isin(["Optimal", "Feasible"])].copy()
+        if not feasible_rows.empty:
+            best_row = feasible_rows.loc[feasible_rows["Profit"].idxmax()]
+            best_limit = int(best_row["Open store limit"])
+            st.success(
+                f"Best configuration for this run: open-store limit = {best_limit}, profit = ₹{best_row['Profit']:.2f}, "
+                f"service rate = {best_row['Service rate (%)']:.2f}%"
+            )
         else:
-            st.info("No assignments were generated for the best feasible solution; the model reported a valid but empty assignment set.")
-    else:
-        st.subheader("2) Detailed solution map")
-        st.info("The optimization did not find a profitable feasible solution for this input combination.")
-        if "Reason" in kpi_df.columns and not kpi_df.empty:
-            reason = kpi_df.iloc[-1].get("Reason", "Unknown")
-            st.warning(f"Failure reason: {reason}")
+            st.warning("No feasible solution was found for any tested store limit. See the reason column above.")
+
+        st.subheader("Profit vs. maximum open stores")
+        fig = px.line(
+            kpi_df,
+            x="Open store limit",
+            y="Profit",
+            markers=True,
+            title="Profit sensitivity to the maximum number of dark stores allowed to open",
+            labels={"Open store limit": "Max stores allowed to open", "Profit": "Profit (₹)"},
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        valid_profit_rows = kpi_df[kpi_df["Status"].isin(["Optimal", "Feasible"]) & (kpi_df["Profit"] > 0)]
+        if not valid_profit_rows.empty:
+            best_limit = int(valid_profit_rows.loc[valid_profit_rows["Profit"].idxmax(), "Open store limit"])
+            selected_result = model_outputs.get(best_limit, {"open_stores": [], "assigned_orders": []})
+            open_stores = selected_result.get("open_stores", [])
+            assigned_orders = selected_result.get("assigned_orders", [])
+
+            st.subheader("2) Detailed solution map")
+            if open_stores or assigned_orders:
+                map_obj = draw_solution_map(customers, stores, open_stores, assigned_orders)
+                st_folium(map_obj, width=1200, height=700)
+            else:
+                st.info("No assignments were generated for the best feasible solution; the model reported a valid but empty assignment set.")
+        else:
+            st.subheader("2) Detailed solution map")
+            st.info("The optimization did not find a profitable feasible solution for this input combination.")
+            if "Reason" in kpi_df.columns and not kpi_df.empty:
+                reason = kpi_df.iloc[-1].get("Reason", "Unknown")
+                st.warning(f"Failure reason: {reason}")
+    except Exception as exc:
+        st.error(f"Unable to render the previous optimization results: {exc}")
+        st.info("Try rerunning the optimization with a lower service distance or fewer customers/stores.")
 else:
     st.info("Configure the inputs on the left and click Run optimization to solve the model.")
