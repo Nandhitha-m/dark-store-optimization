@@ -1,4 +1,5 @@
 import math
+import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -70,7 +71,7 @@ def empty_kpi_row(max_distance_km: float, status: str = "Infeasible", reason: st
 
 
 def normalize_kpi_columns(kpi_df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize KPI column names across all runtime paths and avoid dataframe-key mismatches."""
+    """Normalize KPI DataFrame keys so both new and old runtime paths work."""
     if kpi_df is None:
         return pd.DataFrame()
 
@@ -94,10 +95,24 @@ def normalize_kpi_columns(kpi_df: pd.DataFrame) -> pd.DataFrame:
         "max_distance_km": "Max distance (km)",
     }
 
-    columns_to_rename = {old: new for old, new in rename_map.items() if old in kpi_df.columns and new not in kpi_df.columns}
-    if columns_to_rename:
-        kpi_df = kpi_df.rename(columns=columns_to_rename)
+    for old_name, new_name in rename_map.items():
+        if old_name in kpi_df.columns and new_name not in kpi_df.columns:
+            kpi_df = kpi_df.rename(columns={old_name: new_name})
+
+    if "Open store limit" not in kpi_df.columns and "open_store_limit" in kpi_df.columns:
+        kpi_df = kpi_df.rename(columns={"open_store_limit": "Open store limit"})
+
     return kpi_df
+
+
+def safe_numeric(series: pd.Series, default: float = 0.0) -> float:
+    try:
+        value = pd.to_numeric(series, errors="coerce")
+        if value.empty:
+            return float(default)
+        return float(value.iloc[0]) if len(value) == 1 else float(value.median())
+    except Exception:
+        return float(default)
 
 
 # ---------------------------
@@ -490,110 +505,178 @@ st.write(
     "Assumptions: Chennai city geography is approximated with a realistic latitude/longitude box, customer demand is random but clustered in major neighborhoods, and each candidate dark store has moderate operating costs and capacity."
 )
 
-if st.session_state.run_clicked:
-    try:
-        safe_num_customers = int(num_customers)
-        safe_num_candidates = int(num_candidates)
+try:
+    if st.session_state.run_clicked:
+        try:
+            safe_num_customers = int(num_customers)
+            safe_num_candidates = int(num_candidates)
 
-        if safe_num_customers > 20000:
-            safe_num_customers = 20000
-        if safe_num_candidates > 60:
-            safe_num_candidates = 60
+            if safe_num_customers > 20000:
+                safe_num_customers = 20000
+            if safe_num_candidates > 60:
+                safe_num_candidates = 60
 
-        max_options_per_customer = 16
-        if safe_num_customers >= 15000 or safe_num_candidates >= 40:
-            max_options_per_customer = 10
-        elif safe_num_customers >= 8000:
-            max_options_per_customer = 12
+            max_options_per_customer = 16
+            if safe_num_customers >= 15000 or safe_num_candidates >= 40:
+                max_options_per_customer = 10
+            elif safe_num_customers >= 8000:
+                max_options_per_customer = 12
 
-        rng = np.random.default_rng(safe_num_customers + safe_num_candidates + int(max_distance_km * 10))
-        customers = generate_chennai_customers(safe_num_customers, rng)
-        stores = generate_dark_store_candidates(safe_num_candidates, rng)
-        feasible_pairs = build_feasible_pairs(
-            customers,
-            stores,
-            max_distance_km,
-            max_options_per_customer=max_options_per_customer,
-        )
+            rng = np.random.default_rng(safe_num_customers + safe_num_candidates + int(max_distance_km * 10))
+            customers = generate_chennai_customers(safe_num_customers, rng)
+            stores = generate_dark_store_candidates(safe_num_candidates, rng)
+            feasible_pairs = build_feasible_pairs(
+                customers,
+                stores,
+                max_distance_km,
+                max_options_per_customer=max_options_per_customer,
+            )
 
-        limit_values = [2, 5, 10, 20, 25, 35, 50, 60]
-        scenario_rows = []
-        model_outputs = {}
+            limit_values = [2, 5, 10, 20, 25, 35, 50, 60]
+            scenario_rows = []
+            model_outputs = {}
 
-        progress_bar = st.progress(0)
-        for idx, limit in enumerate(limit_values):
-            if limit > safe_num_candidates:
-                continue
-            progress_bar.progress((idx + 1) / len(limit_values))
-            try:
-                kpi_data, _, result_info = solve_dark_store_problem(
-                    customers=customers,
-                    stores=stores,
-                    feasible_pairs=feasible_pairs,
-                    max_open_stores=limit,
-                    max_distance_km=max_distance_km,
+            progress_bar = st.progress(0)
+            for idx, limit in enumerate(limit_values):
+                if limit > safe_num_candidates:
+                    continue
+                progress_bar.progress((idx + 1) / len(limit_values))
+                try:
+                    kpi_data, _, result_info = solve_dark_store_problem(
+                        customers=customers,
+                        stores=stores,
+                        feasible_pairs=feasible_pairs,
+                        max_open_stores=limit,
+                        max_distance_km=max_distance_km,
+                    )
+                except Exception as exc:
+                    kpi_data = empty_kpi_row(max_distance_km, status="Error", reason=f"Unexpected solver error: {exc}")
+                    result_info = {"open_stores": [], "assigned_orders": []}
+
+                model_outputs[limit] = result_info
+                scenario_rows.append(
+                    {
+                        "Open store limit": limit,
+                        "Status": kpi_data.get("status", "Unknown"),
+                        "Reason": kpi_data.get("reason", "N/A"),
+                        "Profit": kpi_data.get("profit", 0.0),
+                        "Revenue": kpi_data.get("revenue", 0.0),
+                        "Delivery cost": kpi_data.get("delivery_cost", 0.0),
+                        "Fixed cost": kpi_data.get("fixed_cost", 0.0),
+                        "Stores opened": kpi_data.get("stores_opened", 0),
+                        "Demand served": kpi_data.get("demand_served", 0),
+                        "Service rate (%)": kpi_data.get("service_rate", 0.0),
+                        "Average distance (km)": kpi_data.get("avg_distance_km", 0.0),
+                    }
                 )
-            except Exception as exc:
-                kpi_data = empty_kpi_row(max_distance_km, status="Error", reason=f"Unexpected solver error: {exc}")
-                result_info = {"open_stores": [], "assigned_orders": []}
 
-            model_outputs[limit] = result_info
-            scenario_rows.append(
-                {
-                    "Open store limit": limit,
-                    "Status": kpi_data.get("status", "Unknown"),
-                    "Reason": kpi_data.get("reason", "N/A"),
-                    "Profit": kpi_data.get("profit", 0.0),
-                    "Revenue": kpi_data.get("revenue", 0.0),
-                    "Delivery cost": kpi_data.get("delivery_cost", 0.0),
-                    "Fixed cost": kpi_data.get("fixed_cost", 0.0),
-                    "Stores opened": kpi_data.get("stores_opened", 0),
-                    "Demand served": kpi_data.get("demand_served", 0),
-                    "Service rate (%)": kpi_data.get("service_rate", 0.0),
-                    "Average distance (km)": kpi_data.get("avg_distance_km", 0.0),
-                }
+            if not scenario_rows:
+                kpi_df = normalize_kpi_columns(pd.DataFrame([empty_kpi_row(max_distance_km, status="No feasible runs", reason="No tested store limits fit the candidate count.")]))
+            else:
+                kpi_df = normalize_kpi_columns(pd.DataFrame(scenario_rows))
+
+            st.session_state.last_run = {
+                "customers": customers,
+                "stores": stores,
+                "kpi_df": kpi_df,
+                "model_outputs": model_outputs,
+            }
+
+            st.subheader("1) KPI summary")
+            st.dataframe(kpi_df, use_container_width=True)
+
+            feasible_rows = kpi_df[kpi_df["Status"].isin(["Optimal", "Feasible"])].copy()
+            if not feasible_rows.empty:
+                feasible_rows["Profit"] = pd.to_numeric(feasible_rows["Profit"], errors="coerce").fillna(0.0)
+                best_row = feasible_rows.loc[feasible_rows["Profit"].idxmax()]
+                best_limit = int(best_row["Open store limit"])
+                st.success(
+                    f"Best configuration for this run: open-store limit = {best_limit}, profit = ₹{best_row['Profit']:.2f}, "
+                    f"service rate = {best_row['Service rate (%)']:.2f}%"
+                )
+            else:
+                st.warning("No feasible solution was found for any tested store limit. See the reason column above.")
+
+            st.subheader("Profit vs. maximum open stores")
+            fig = px.line(
+                kpi_df,
+                x="Open store limit",
+                y="Profit",
+                markers=True,
+                title="Profit sensitivity to the maximum number of dark stores allowed to open",
+                labels={"Open store limit": "Max stores allowed to open", "Profit": "Profit (₹)"},
             )
+            st.plotly_chart(fig, use_container_width=True)
 
-        if not scenario_rows:
-            kpi_df = normalize_kpi_columns(pd.DataFrame([empty_kpi_row(max_distance_km, status="No feasible runs", reason="No tested store limits fit the candidate count.")]))
-        else:
-            kpi_df = normalize_kpi_columns(pd.DataFrame(scenario_rows))
+            if not kpi_df.empty and "Open store limit" in kpi_df.columns:
+                valid_profit_rows = kpi_df[kpi_df["Status"].isin(["Optimal", "Feasible"]) & (pd.to_numeric(kpi_df["Profit"], errors="coerce") > 0)]
+                if not valid_profit_rows.empty:
+                    valid_profit_rows = valid_profit_rows.copy()
+                    valid_profit_rows["Profit"] = pd.to_numeric(valid_profit_rows["Profit"], errors="coerce").fillna(0.0)
+                    best_limit = int(valid_profit_rows.loc[valid_profit_rows["Profit"].idxmax(), "Open store limit"])
+                    selected_result = model_outputs.get(best_limit, {"open_stores": [], "assigned_orders": []})
+                    open_stores = selected_result.get("open_stores", [])
+                    assigned_orders = selected_result.get("assigned_orders", [])
 
-        st.session_state.last_run = {
-            "customers": customers,
-            "stores": stores,
-            "kpi_df": kpi_df,
-            "model_outputs": model_outputs,
-        }
+                    st.subheader("2) Detailed solution map")
+                    if open_stores or assigned_orders:
+                        map_obj = draw_solution_map(customers, stores, open_stores, assigned_orders)
+                        st_folium(map_obj, width=1200, height=700)
+                    else:
+                        st.info("No assignments were generated for the best feasible solution; the model reported a valid but empty assignment set.")
+                else:
+                    st.subheader("2) Detailed solution map")
+                    st.info("The optimization did not find a profitable feasible solution for this input combination.")
+                    last_row = kpi_df.iloc[-1]
+                    st.warning(f"Failure reason: {last_row.get('Reason', 'Unknown')}")
+            else:
+                st.subheader("2) Detailed solution map")
+                st.info("No valid optimization output is available.")
 
-        st.subheader("1) KPI summary")
-        st.dataframe(kpi_df, use_container_width=True)
+        except Exception as exc:
+            st.error(f"The optimization failed unexpectedly: {exc}")
+            st.code(traceback.format_exc())
+            st.info("Try reducing the service distance if the model becomes infeasible, or lower the customer/store count to keep the feasibility search stable.")
+            st.stop()
 
-        feasible_rows = kpi_df[kpi_df["Status"].isin(["Optimal", "Feasible"])].copy()
-        if not feasible_rows.empty:
-            best_row = feasible_rows.loc[feasible_rows["Profit"].idxmax()]
-            best_limit = int(best_row["Open store limit"])
-            st.success(
-                f"Best configuration for this run: open-store limit = {best_limit}, profit = ₹{best_row['Profit']:.2f}, "
-                f"service rate = {best_row['Service rate (%)']:.2f}%"
+    elif st.session_state.last_run is not None:
+        try:
+            last_run = st.session_state.last_run
+            kpi_df = normalize_kpi_columns(last_run["kpi_df"])
+            model_outputs = last_run["model_outputs"]
+            customers = last_run["customers"]
+            stores = last_run["stores"]
+
+            st.subheader("1) KPI summary")
+            st.dataframe(kpi_df, use_container_width=True)
+
+            feasible_rows = kpi_df[kpi_df["Status"].isin(["Optimal", "Feasible"])].copy()
+            if not feasible_rows.empty:
+                feasible_rows["Profit"] = pd.to_numeric(feasible_rows["Profit"], errors="coerce").fillna(0.0)
+                best_row = feasible_rows.loc[feasible_rows["Profit"].idxmax()]
+                best_limit = int(best_row["Open store limit"])
+                st.success(
+                    f"Best configuration for this run: open-store limit = {best_limit}, profit = ₹{best_row['Profit']:.2f}, "
+                    f"service rate = {best_row['Service rate (%)']:.2f}%"
+                )
+            else:
+                st.warning("No feasible solution was found for any tested store limit. See the reason column above.")
+
+            st.subheader("Profit vs. maximum open stores")
+            fig = px.line(
+                kpi_df,
+                x="Open store limit",
+                y="Profit",
+                markers=True,
+                title="Profit sensitivity to the maximum number of dark stores allowed to open",
+                labels={"Open store limit": "Max stores allowed to open", "Profit": "Profit (₹)"},
             )
-        else:
-            st.warning("No feasible solution was found for any tested store limit. See the reason column above.")
+            st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("Profit vs. maximum open stores")
-        fig = px.line(
-            kpi_df,
-            x="Open store limit",
-            y="Profit",
-            markers=True,
-            title="Profit sensitivity to the maximum number of dark stores allowed to open",
-            labels={"Open store limit": "Max stores allowed to open", "Profit": "Profit (₹)"},
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        if not kpi_df.empty and "Open store limit" in kpi_df.columns:
-            valid_profit_rows = kpi_df[kpi_df["Status"].isin(["Optimal", "Feasible"]) & (kpi_df["Profit"] > 0)]
+            valid_profit_rows = kpi_df[kpi_df["Status"].isin(["Optimal", "Feasible"]) & (pd.to_numeric(kpi_df["Profit"], errors="coerce") > 0)]
             if not valid_profit_rows.empty:
+                valid_profit_rows = valid_profit_rows.copy()
+                valid_profit_rows["Profit"] = pd.to_numeric(valid_profit_rows["Profit"], errors="coerce").fillna(0.0)
                 best_limit = int(valid_profit_rows.loc[valid_profit_rows["Profit"].idxmax(), "Open store limit"])
                 selected_result = model_outputs.get(best_limit, {"open_stores": [], "assigned_orders": []})
                 open_stores = selected_result.get("open_stores", [])
@@ -608,70 +691,17 @@ if st.session_state.run_clicked:
             else:
                 st.subheader("2) Detailed solution map")
                 st.info("The optimization did not find a profitable feasible solution for this input combination.")
-                last_row = kpi_df.iloc[-1]
-                st.warning(f"Failure reason: {last_row.get('Reason', 'Unknown')}")
-        else:
-            st.subheader("2) Detailed solution map")
-            st.info("No valid optimization output is available.")
-
-    except Exception as exc:
-        st.error(f"The optimization failed unexpectedly: {exc}")
-        st.info("Try reducing the service distance if the model becomes infeasible, or lower the customer/store count to keep the feasibility search stable.")
-
-elif st.session_state.last_run is not None:
-    try:
-        last_run = st.session_state.last_run
-        kpi_df = normalize_kpi_columns(last_run["kpi_df"])
-        model_outputs = last_run["model_outputs"]
-        customers = last_run["customers"]
-        stores = last_run["stores"]
-
-        st.subheader("1) KPI summary")
-        st.dataframe(kpi_df, use_container_width=True)
-
-        feasible_rows = kpi_df[kpi_df["Status"].isin(["Optimal", "Feasible"])].copy()
-        if not feasible_rows.empty:
-            best_row = feasible_rows.loc[feasible_rows["Profit"].idxmax()]
-            best_limit = int(best_row["Open store limit"])
-            st.success(
-                f"Best configuration for this run: open-store limit = {best_limit}, profit = ₹{best_row['Profit']:.2f}, "
-                f"service rate = {best_row['Service rate (%)']:.2f}%"
-            )
-        else:
-            st.warning("No feasible solution was found for any tested store limit. See the reason column above.")
-
-        st.subheader("Profit vs. maximum open stores")
-        fig = px.line(
-            kpi_df,
-            x="Open store limit",
-            y="Profit",
-            markers=True,
-            title="Profit sensitivity to the maximum number of dark stores allowed to open",
-            labels={"Open store limit": "Max stores allowed to open", "Profit": "Profit (₹)"},
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        valid_profit_rows = kpi_df[kpi_df["Status"].isin(["Optimal", "Feasible"]) & (kpi_df["Profit"] > 0)]
-        if not valid_profit_rows.empty:
-            best_limit = int(valid_profit_rows.loc[valid_profit_rows["Profit"].idxmax(), "Open store limit"])
-            selected_result = model_outputs.get(best_limit, {"open_stores": [], "assigned_orders": []})
-            open_stores = selected_result.get("open_stores", [])
-            assigned_orders = selected_result.get("assigned_orders", [])
-
-            st.subheader("2) Detailed solution map")
-            if open_stores or assigned_orders:
-                map_obj = draw_solution_map(customers, stores, open_stores, assigned_orders)
-                st_folium(map_obj, width=1200, height=700)
-            else:
-                st.info("No assignments were generated for the best feasible solution; the model reported a valid but empty assignment set.")
-        else:
-            st.subheader("2) Detailed solution map")
-            st.info("The optimization did not find a profitable feasible solution for this input combination.")
-            if "Reason" in kpi_df.columns and not kpi_df.empty:
-                reason = kpi_df.iloc[-1].get("Reason", "Unknown")
-                st.warning(f"Failure reason: {reason}")
-    except Exception as exc:
-        st.error(f"Unable to render the previous optimization results: {exc}")
-        st.info("Try rerunning the optimization with a lower service distance or fewer customers/stores.")
-else:
-    st.info("Configure the inputs on the left and click Run optimization to solve the model.")
+                if "Reason" in kpi_df.columns and not kpi_df.empty:
+                    reason = kpi_df.iloc[-1].get("Reason", "Unknown")
+                    st.warning(f"Failure reason: {reason}")
+        except Exception as exc:
+            st.error(f"Unable to render the previous optimization results: {exc}")
+            st.code(traceback.format_exc())
+            st.info("Try rerunning the optimization with a lower service distance or fewer customers/stores.")
+            st.stop()
+    else:
+        st.info("Configure the inputs on the left and click Run optimization to solve the model.")
+except Exception as exc:
+    st.error("Unexpected application error. Please check the input values and try again.")
+    st.code(traceback.format_exc())
+    st.stop()
